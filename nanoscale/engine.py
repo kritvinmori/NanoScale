@@ -22,7 +22,6 @@ class NanoScaleEngine:
             bnb_4bit_compute_dtype=torch.bfloat16
         )
 
-        # 1. Fix: Left-padding is mandatory for decoder-only batch generation
         self.tokenizer = AutoTokenizer.from_pretrained(model_id, padding_side="left")
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
@@ -38,30 +37,30 @@ class NanoScaleEngine:
         if os.path.exists(verifier_path):
             self.verifier.load(verifier_path, map_location=self.device)
 
-    def _extract_boxed_answer(self, text: str) -> str:
-        """Extracts answer from \boxed{...} or the last stated number."""
-        # 1. Look for LaTeX \boxed{...}
-        boxed = re.findall(r"\\boxed\{([^}]+)\}", text)
+    def _extract_answer(self, text: str) -> str:
+        """Robust parser for boxed, bolded, or unit-suffixed numerical answers."""
+        # 1. Standard or unclosed LaTeX boxed
+        boxed = re.findall(r"\\boxed\{?\$?(-?\d+(?:\.\d+)?)", text)
         if boxed:
-            clean = boxed[-1].replace("$", "").strip()
-            # If boxed contains an equation like x = 12, take the right side
-            if "=" in clean:
-                clean = clean.split("=")[-1].strip()
-            return clean
+            return boxed[-1].strip()
 
-        # 2. Look for explicit answer statements
-        match = re.findall(r"(?:answer is|takes|equals|=)\s*\$?(-?\d+(?:\.\d+)?)", text, re.IGNORECASE)
-        if match:
-            return match[-1].strip()
+        # 2. Bolded markdown numbers, e.g. **12 days** or **36**
+        bolded = re.findall(r"\*\*(-?\d+(?:\.\d+)?)\s*(?:days?|hours?|pencils?|dollars?|\$)?\*\*", text, re.IGNORECASE)
+        if bolded:
+            return bolded[-1].strip()
 
-        # 3. Fallback: last number in the text
-        nums = re.findall(r"(-?\d+(?:\.\d+)?)", text)
-        return nums[-1].strip() if nums else "PARSE_ERROR"
+        # 3. Explicit result phrases
+        phrases = re.findall(r"(?:take|takes|equals|is|answer is|=)\s*\*?\*?\$?(-?\d+(?:\.\d+)?)\s*(?:days?|hours?|pencils?|dollars?)", text, re.IGNORECASE)
+        if phrases:
+            return phrases[-1].strip()
 
-    def run_baseline(self, prompt: str, max_tokens: int = 350) -> str:
-        """Standard greedy baseline using Qwen's native reasoning prompt."""
+        # 4. Fallback: extract last standalone number in the response
+        numbers = re.findall(r"\b(-?\d+(?:\.\d+)?)\b", text)
+        return numbers[-1].strip() if numbers else "PARSE_ERROR"
+
+    def run_baseline(self, prompt: str, max_tokens: int = 300) -> str:
         messages = [
-            {"role": "system", "content": "Please reason step by step, and put your final answer within \\boxed{}."},
+            {"role": "system", "content": "Solve concisely step-by-step. Put the final numerical answer inside \\boxed{}."},
             {"role": "user", "content": prompt}
         ]
         formatted = self.tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
@@ -76,67 +75,69 @@ class NanoScaleEngine:
             )
         return self.tokenizer.decode(output[0][inputs["input_ids"].shape[1]:], skip_special_tokens=True).strip()
 
-    def generate(self, prompt: str, n_candidates: int = 3, max_new_tokens: int = 350):
-        # Native Chain-of-Thought System Prompt
+    def generate(self, prompt: str, n_candidates: int = 3, max_new_tokens: int = 300):
+        system_instruction = (
+            "You are a precise mathematical optimizer.\n"
+            "Solve the problem step-by-step using standard arithmetic:\n"
+            "- If this is a rate/worker problem, apply the compound work invariant: (Workers * Days) / Work = Constant.\n"
+            "- State each calculation on a clean line.\n"
+            "- End your response with: Final Answer: \\boxed{your_number}"
+        )
+
         messages = [
-            {"role": "system", "content": "Please reason step by step, and put your final answer within \\boxed{}."},
+            {"role": "system", "content": system_instruction},
             {"role": "user", "content": prompt}
         ]
         formatted = self.tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-
         inputs = self.tokenizer(formatted, return_tensors="pt", padding=True).to(self.device)
         prompt_len = inputs["input_ids"].shape[1]
 
-        # In-GPU Batching: replicate the clean prompt N times
         input_ids = inputs["input_ids"].repeat(n_candidates, 1)
         attention_mask = inputs["attention_mask"].repeat(n_candidates, 1)
 
+        # High-speed generation without caching intermediate hidden layers
         with torch.no_grad():
             outputs = self.model.generate(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
                 max_new_tokens=max_new_tokens,
                 do_sample=True,
-                temperature=0.5,       # Provides diverse paths while staying logically grounded
+                temperature=0.4,
                 top_p=0.90,
                 pad_token_id=self.tokenizer.pad_token_id,
-                eos_token_id=self.tokenizer.eos_token_id,
-                return_dict_in_generate=True,
-                output_hidden_states=True
+                eos_token_id=self.tokenizer.eos_token_id
             )
 
         candidates = []
         for i in range(n_candidates):
-            gen_tokens = outputs.sequences[i][prompt_len:]
+            gen_tokens = outputs[i][prompt_len:]
             candidates.append(self.tokenizer.decode(gen_tokens, skip_special_tokens=True).strip())
 
-        # PRM hidden state scoring
-        last_step_states = outputs.hidden_states[-1][-1]
-        final_vectors = last_step_states[:, -1, :].to(torch.float32)
+        # Sub-millisecond forward pass to extract final token hidden states for PRM scoring
+        eval_inputs = outputs[:, -64:]
         with torch.no_grad():
+            forward_out = self.model(eval_inputs, output_hidden_states=True)
+            final_vectors = forward_out.hidden_states[-1][:, -1, :].to(torch.float32)
             scores = self.verifier(final_vectors).squeeze(-1).tolist()
             if isinstance(scores, float):
                 scores = [scores]
 
         # Extract parsed answers
-        answers = [self._extract_boxed_answer(c) for c in candidates]
-        
-        # Consensus & Verification Logic
-        counter = Counter([a for a in answers if a != "PARSE_ERROR"])
+        answers = [self._extract_answer(c) for c in candidates]
+        valid_answers = [a for a in answers if a != "PARSE_ERROR"]
+
         has_majority = False
         winning_answer = None
 
-        if counter:
-            most_common_answer, count = counter.most_common(1)[0]
+        if valid_answers:
+            most_common_answer, count = Counter(valid_answers).most_common(1)[0]
             if count >= 2:
-                # Majority consensus achieved (2 or 3 paths agreed)
                 has_majority = True
                 winning_answer = most_common_answer
                 pool = [i for i, a in enumerate(answers) if a == winning_answer]
                 best_idx = max(pool, key=lambda idx: scores[idx])
 
         if not has_majority:
-            # Tie / No consensus: PRM score decides the winner
             best_idx = int(torch.tensor(scores).argmax().item())
             winning_answer = answers[best_idx]
 

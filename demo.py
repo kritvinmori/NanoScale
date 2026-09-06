@@ -10,7 +10,7 @@ def run_demo():
     console.rule("[bold cyan]NanoScale vs. Stock 1.5B Head-to-Head[/bold cyan]")
     engine = NanoScaleEngine()
 
-    test_prompt = "If 6 workers can build 3 houses in 12 days, how many days does it take 4 workers to build 2 houses?"
+    test_prompt = "An electronics store offers a 20% discount on a $400 laptop. A member receives an additional 10% discount off the already discounted price. What is the final price before tax?"
 
     console.print(f"\n[bold yellow]Target Problem:[/bold yellow] {test_prompt}\n")
 
