@@ -10,7 +10,11 @@ def run_demo():
     console.rule("[bold cyan]NanoScale vs. Stock 1.5B Head-to-Head[/bold cyan]")
     engine = NanoScaleEngine()
 
-    test_prompt = "An electronics store offers a 20% discount on a $400 laptop. A member receives an additional 10% discount off the already discounted price. What is the final price before tax?"
+    test_prompt = (
+        "A patch of lily pads on a lake doubles in size every day. "
+        "It takes exactly 48 days for the patch to completely cover the entire lake. "
+        "On which day did the patch cover exactly 25% of the lake?"
+    )
 
     console.print(f"\n[bold yellow]Target Problem:[/bold yellow] {test_prompt}\n")
 
